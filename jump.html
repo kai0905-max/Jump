@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI 跳繩計數器</title>
+<style>
+  :root { --bg:#0f1115; --card:#1a1d24; --fg:#e8eaf0; --muted:#8a90a0; --accent:#4ade80; --warn:#fbbf24; }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:-apple-system,"PingFang TC","Noto Sans TC",system-ui,sans-serif; background:var(--bg); color:var(--fg); }
+  header { padding:12px 16px; display:flex; align-items:center; justify-content:space-between; }
+  h1 { font-size:18px; margin:0; }
+  #status { font-size:13px; color:var(--muted); }
+  main { max-width:900px; margin:0 auto; padding:0 12px 24px; }
+  .stage { position:relative; background:#000; border-radius:12px; overflow:hidden; aspect-ratio:4/3; }
+  video, canvas.overlay { position:absolute; inset:0; width:100%; height:100%; object-fit:contain; }
+  .mirror { transform:scaleX(-1); }
+  .count { position:absolute; top:8px; left:12px; font-size:72px; font-weight:800; color:var(--accent);
+           text-shadow:0 2px 8px rgba(0,0,0,.7); font-variant-numeric:tabular-nums; line-height:1; }
+  .sub { position:absolute; top:84px; left:14px; font-size:14px; color:#fff; text-shadow:0 1px 4px #000; }
+  .fps { position:absolute; top:8px; right:12px; font-size:12px; color:#fff; text-shadow:0 1px 4px #000; }
+  .hint { position:absolute; bottom:10px; left:0; right:0; text-align:center; font-size:14px; color:var(--warn); text-shadow:0 1px 4px #000; }
+  canvas#wave { width:100%; height:80px; background:var(--card); border-radius:10px; margin-top:10px; display:block; }
+  .controls { display:flex; flex-wrap:wrap; gap:8px; margin-top:12px; }
+  button, label.btn { background:var(--card); color:var(--fg); border:1px solid #2c313c; border-radius:10px; padding:10px 14px; font-size:15px; cursor:pointer; }
+  button.primary { background:var(--accent); color:#06210f; border:none; font-weight:700; }
+  button:disabled { opacity:.5; cursor:default; }
+  .row { display:flex; align-items:center; gap:10px; margin-top:12px; font-size:14px; color:var(--muted); flex-wrap:wrap; }
+  input[type=range] { flex:1; min-width:160px; }
+  select { background:var(--card); color:var(--fg); border:1px solid #2c313c; border-radius:8px; padding:6px; }
+  .stats { display:grid; grid-template-columns:repeat(3,1fr); gap:8px; margin-top:12px; }
+  .stat { background:var(--card); border-radius:10px; padding:10px; text-align:center; }
+  .stat b { display:block; font-size:22px; font-variant-numeric:tabular-nums; }
+  .stat span { font-size:12px; color:var(--muted); }
+  details { margin-top:14px; font-size:14px; color:var(--muted); }
+  details li { margin:4px 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>🪢 AI 跳繩計數器</h1>
+  <span id="status">載入模型中…</span>
+</header>
+<main>
+  <div class="stage">
+    <video id="video" playsinline muted></video>
+    <canvas id="overlay" class="overlay"></canvas>
+    <div class="count" id="count">0</div>
+    <div class="sub" id="timer">00:00</div>
+    <div class="fps" id="fps"></div>
+    <div class="hint" id="hint">按「開啟鏡頭」或「選擇影片」開始</div>
+  </div>
+  <canvas id="wave"></canvas>
+
+  <div class="controls">
+    <button class="primary" id="btnCam" disabled>開啟鏡頭</button>
+    <button id="btnFlip" disabled>切換前/後鏡頭</button>
+    <label class="btn">選擇影片<input type="file" id="file" accept="video/*" hidden></label>
+    <button id="btnReset">歸零</button>
+  </div>
+
+  <div class="row">
+    靈敏度
+    <input type="range" id="sens" min="1" max="10" value="3">
+    <span id="sensVal">0.03</span>
+  </div>
+  <div class="row">
+    <label><input type="checkbox" id="voice"> 每
+      <select id="voiceN"><option>10</option><option>50</option><option selected>100</option></select>
+      下語音報數</label>
+  </div>
+
+  <div class="stats">
+    <div class="stat"><b id="sJpm">0</b><span>目前每分鐘</span></div>
+    <div class="stat"><b id="sAvg">0</b><span>平均每分鐘</span></div>
+    <div class="stat"><b id="sBest">0</b><span>最長連跳</span></div>
+  </div>
+
+  <details>
+    <summary>使用說明</summary>
+    <ul>
+      <li>手機或筆電固定好，<b>讓畫面拍到全身</b>（距離約 2–3 公尺），光線要夠。</li>
+      <li>計數依據是「髖部上下起伏」，所以數的是跳躍次數；雙搖一次跳躍只算 1 下。</li>
+      <li>多算：把靈敏度調大（數值變大＝門檻變高）。漏算：調小。</li>
+      <li>停下來超過 2 秒，「連跳」會重新計算，總數不會歸零。</li>
+      <li>所有運算都在你的裝置上完成，影像不會上傳。</li>
+    </ul>
+  </details>
+</main>
+
+<script type="module">
+import { FilesetResolver, PoseLandmarker, DrawingUtils }
+  from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+const $ = id => document.getElementById(id);
+const video = $("video"), overlay = $("overlay"), octx = overlay.getContext("2d");
+const wave = $("wave"), wctx = wave.getContext("2d");
+let landmarker, drawer, stream = null, facing = "user", running = false;
+
+// ---------- 計數狀態 ----------
+const S = {
+  count: 0, state: "down", extreme: null, smooth: null,
+  lastCountT: 0, startT: null, lastJumpT: 0,
+  streak: 0, best: 0, times: [], history: []
+};
+let thrRatio = 0.03;
+const MIN_INTERVAL = 150; // ms，兩下之間最短間隔（約每秒 6.6 下上限）
+
+function resetCount() {
+  Object.assign(S, { count:0, state:"down", extreme:null, smooth:null, lastCountT:0,
+    startT:null, lastJumpT:0, streak:0, best:0, times:[], history:[] });
+  render();
+}
+
+function speak(n) {
+  if (!$("voice").checked || n % +$("voiceN").value !== 0) return;
+  try { const u = new SpeechSynthesisUtterance(String(n)); u.lang = "zh-TW"; speechSynthesis.speak(u); } catch {}
+}
+
+// y 往下為正：跳起來 y 變小。用遲滯（hysteresis）狀態機抓「起跳」。
+function feed(y, torso, t) {
+  S.smooth = S.smooth == null ? y : S.smooth * 0.5 + y * 0.5;
+  const v = S.smooth, thr = thrRatio * torso;
+  S.history.push(v / torso); if (S.history.length > 240) S.history.shift();
+  if (S.extreme == null) { S.extreme = v; return; }
+
+  if (S.state === "down") {
+    S.extreme = Math.max(S.extreme, v);            // 追蹤最低點
+    if (v < S.extreme - thr) {                     // 明顯往上 → 起跳
+      S.state = "up"; S.extreme = v;
+      if (t - S.lastCountT >= MIN_INTERVAL) {
+        if (t - S.lastJumpT > 2000) S.streak = 0;
+        S.count++; S.streak++; S.best = Math.max(S.best, S.streak);
+        S.lastCountT = S.lastJumpT = t;
+        S.times.push(t); if (S.times.length > 30) S.times.shift();
+        if (S.startT == null) S.startT = t;
+        speak(S.count);
+      }
+    }
+  } else {
+    S.extreme = Math.min(S.extreme, v);            // 追蹤最高點
+    if (v > S.extreme + thr) { S.state = "down"; S.extreme = v; }
+  }
+}
+
+function render() {
+  $("count").textContent = S.count;
+  const now = performance.now();
+  const el = S.startT ? (now - S.startT) / 1000 : 0;
+  $("timer").textContent = `${String(Math.floor(el/60)).padStart(2,"0")}:${String(Math.floor(el%60)).padStart(2,"0")}`;
+  const recent = S.times.filter(t => now - t < 5000);
+  $("sJpm").textContent = recent.length >= 2 ? Math.round((recent.length-1) / ((recent.at(-1)-recent[0])/60000)) : 0;
+  $("sAvg").textContent = el > 3 ? Math.round(S.count / (el/60)) : 0;
+  $("sBest").textContent = S.best;
+  drawWave();
+}
+
+function drawWave() {
+  const w = wave.width = wave.clientWidth * devicePixelRatio, h = wave.height = wave.clientHeight * devicePixelRatio;
+  wctx.clearRect(0,0,w,h);
+  const H = S.history; if (H.length < 2) return;
+  const mn = Math.min(...H), mx = Math.max(...H), span = Math.max(mx - mn, 0.05);
+  wctx.strokeStyle = "#4ade80"; wctx.lineWidth = 2 * devicePixelRatio; wctx.beginPath();
+  H.forEach((v,i) => { const x = i/(240-1)*w, y = h - (mx - v)/span*(h*0.8) - h*0.1;
+    i ? wctx.lineTo(x,y) : wctx.moveTo(x,y); });
+  wctx.stroke();
+}
+
+// ---------- 模型 ----------
+async function init() {
+  const files = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+  const opts = d => ({
+    baseOptions: { modelAssetPath: "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task", delegate: d },
+    runningMode: "VIDEO", numPoses: 1
+  });
+  try { landmarker = await PoseLandmarker.createFromOptions(files, opts("GPU")); }
+  catch { landmarker = await PoseLandmarker.createFromOptions(files, opts("CPU")); }
+  drawer = new DrawingUtils(octx);
+  $("status").textContent = "模型就緒";
+  $("btnCam").disabled = false;
+}
+
+// ---------- 迴圈 ----------
+let lastTs = -1, fpsN = 0, fpsT = performance.now();
+function loop() {
+  if (!running) return;
+  if (video.readyState >= 2 && !video.paused) {
+    const ts = performance.now();
+    if (ts > lastTs) {
+      lastTs = ts;
+      if (overlay.width !== video.videoWidth) { overlay.width = video.videoWidth; overlay.height = video.videoHeight; }
+      const r = landmarker.detectForVideo(video, ts);
+      octx.clearRect(0,0,overlay.width,overlay.height);
+      const lm = r.landmarks?.[0];
+      if (lm) {
+        drawer.drawConnectors(lm, PoseLandmarker.POSE_CONNECTIONS, { color:"#ffffffaa", lineWidth:3 });
+        drawer.drawLandmarks([lm[23], lm[24]], { color:"#4ade80", radius:6 });
+        const vis = Math.min(lm[23].visibility ?? 1, lm[24].visibility ?? 1, lm[11].visibility ?? 1, lm[12].visibility ?? 1);
+        const ankles = Math.min(lm[27].visibility ?? 1, lm[28].visibility ?? 1);
+        if (vis > 0.5) {
+          const hipY = (lm[23].y + lm[24].y) / 2, shY = (lm[11].y + lm[12].y) / 2;
+          const torso = Math.abs(hipY - shY);
+          if (torso > 0.03) feed(hipY, torso, ts);
+          $("hint").textContent = ankles < 0.4 ? "請退後一點，讓腳也入鏡" : "";
+        } else $("hint").textContent = "偵測不到身體，請整個人入鏡";
+      } else $("hint").textContent = "偵測不到人";
+      fpsN++;
+      if (ts - fpsT > 1000) { $("fps").textContent = `${Math.round(fpsN*1000/(ts-fpsT))} fps`; fpsN = 0; fpsT = ts; }
+    }
+  }
+  render();
+  requestAnimationFrame(loop);
+}
+
+// ---------- 鏡頭 / 影片 ----------
+let wakeLock = null;
+async function keepAwake() { try { wakeLock = await navigator.wakeLock?.request("screen"); } catch {} }
+
+async function startCam() {
+  stopSource();
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: facing, width: { ideal: 640 }, height: { ideal: 480 } }, audio: false });
+  } catch (e) {
+    $("hint").textContent = "無法開啟鏡頭：" + e.message; return;
+  }
+  video.srcObject = stream; video.removeAttribute("src");
+  const mirror = facing === "user";
+  video.classList.toggle("mirror", mirror); overlay.classList.toggle("mirror", mirror);
+  await video.play();
+  $("btnFlip").disabled = false; $("btnCam").textContent = "重新開啟鏡頭";
+  keepAwake(); running = true; loop();
+}
+
+function stopSource() {
+  running = false;
+  stream?.getTracks().forEach(t => t.stop()); stream = null;
+}
+
+$("btnCam").onclick = startCam;
+$("btnFlip").onclick = () => { facing = facing === "user" ? "environment" : "user"; startCam(); };
+$("btnReset").onclick = resetCount;
+$("file").onchange = async e => {
+  const f = e.target.files[0]; if (!f || !landmarker) return;
+  stopSource(); resetCount();
+  video.srcObject = null; video.src = URL.createObjectURL(f); video.loop = false;
+  video.classList.remove("mirror"); overlay.classList.remove("mirror");
+  await video.play(); running = true; loop();
+};
+$("sens").oninput = e => { thrRatio = e.target.value / 100; $("sensVal").textContent = thrRatio.toFixed(2); };
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible" && stream) keepAwake(); });
+
+init().catch(e => { $("status").textContent = "模型載入失敗：" + e.message; });
+render();
+</script>
+</body>
+</html>
